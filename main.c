@@ -1,221 +1,172 @@
-#include <stdint.h>
-#include <stdio.h>   // 引入标准输入输出库 (printf, sscanf)
-#include <string.h>  // 引入字符串处理库 (strcmp, strncmp)
-#include <sys/stat.h> // 用于 _fstat 的标准结构体
-#include <sys/types.h> // 必须引入这个头文件以支持 ptrdiff_t
+#include <libopencm3/stm32/rcc.h>
+#include <libopencm3/stm32/gpio.h>
+#include <libopencm3/stm32/usart.h>
+#include <libopencm3/stm32/dma.h> // 【新增】DMA 神器
+#include <stdio.h>
+#include <string.h>
 
-// --- 寄存器基地址定义 ---
-#define RCC_BASE      0x40021000
-#define RCC_CR        (*(volatile uint32_t *)(RCC_BASE + 0x00))
-#define RCC_CFGR      (*(volatile uint32_t *)(RCC_BASE + 0x04))
-#define FLASH_ACR     (*(volatile uint32_t *)(0x40022000 + 0x00))
+#define SHELL_PROMPT "root@c8t6:~# "
+#define RX_BUF_SIZE 64
+#define TX_BUF_SIZE 512 // 分配给 DMA 的专属发送内存区
 
-// --- 链接脚本导出的符号 ---
-extern uint32_t _estack, _sdata, _edata, _etext, _sbss, _ebss;
+char rx_buf[RX_BUF_SIZE];
+uint8_t rx_idx = 0;
 
-// --- uart.c 导出的底层硬件接口 ---
-extern void uart_init(void);
-extern void uart_putc(char c);
-extern char uart_getc(void);
+// DMA 专属内存（必须是全局变量，因为函数返回后 DMA 还在后台慢慢读它）
+uint8_t dma_tx_buf[TX_BUF_SIZE]; 
 
-// ==========================================
-// 终极系统调用桩函数 (Syscall Stubs)
-// 完全接管 Newlib-nano 的底层，彻底消灭所有 Warning
-// ==========================================
-
-// 这是你刚才在 link.ld 里加的那个“路标”
-extern char end; 
-
-// 真正的动态内存分配底层引擎
-void *_sbrk(ptrdiff_t incr) {
-    extern char end; 
-    static char *heap_end = 0;
-    char *prev_heap_end;
-
-    if (heap_end == 0) {
-        heap_end = &end;
-    }
-
-    // 【防暴毙装甲】：强制堆指针向 8 字节对齐
-    heap_end = (char *)(((uint32_t)heap_end + 7) & ~7);
-
-    prev_heap_end = heap_end;
-    heap_end += incr;
-    
-    return (void *)prev_heap_end;
-}
-
-// 1. 我们最核心的输出重定向
+/* ==========================================================
+ * 魔法缝合区：用 DMA 劫持 printf 输出
+ * ========================================================== */
 int _write(int file, char *ptr, int len) {
-    for (int i = 0; i < len; i++) {
-        uart_putc(ptr[i]);
+    if (file != 1) return -1;
+
+    // 1. 【防撞车机制】如果上一次 DMA 还没搬完，稍微等一下
+    // (实际上如果配合环形缓冲区能做到完全不阻塞，这里为了代码极简先用线性等待)
+    while (dma_get_number_of_data(DMA1, DMA_CHANNEL4) > 0);
+
+    // 必须先关闭通道，才能写入新的传输配置
+    dma_disable_channel(DMA1, DMA_CHANNEL4);
+
+    // 2. 把数据快速搬运进 DMA 的专属内存，顺便处理回车换行
+    int dma_len = 0;
+    for (int i = 0; i < len && dma_len < TX_BUF_SIZE - 1; i++) {
+        if (ptr[i] == '\n') {
+            dma_tx_buf[dma_len++] = '\r';
+        }
+        dma_tx_buf[dma_len++] = ptr[i];
     }
+
+    // 3. 【点火发射】给 DMA 分配任务并启动
+    dma_set_memory_address(DMA1, DMA_CHANNEL4, (uint32_t)dma_tx_buf);
+    dma_set_number_of_data(DMA1, DMA_CHANNEL4, dma_len);
+    dma_enable_channel(DMA1, DMA_CHANNEL4);
+
+    // CPU 瞬间返回，深藏功与名。此时后台的数据正在疯狂流向 USART！
     return len;
 }
 
-// 2. 以下全部是安抚编译器的空壳，保证签名完全符合 POSIX 标准
-int _close(int file) { 
-    return -1; 
-}
+/* ==========================================================
+ * 硬件初始化 (新增 DMA 配置)
+ * ========================================================== */
+static void system_setup(void) {
+    rcc_clock_setup_pll(&rcc_hse_configs[RCC_CLOCK_HSE8_72MHZ]);
 
-int _fstat(int file, struct stat *st) { 
-    st->st_mode = S_IFCHR; // 告诉库：我们是一个字符设备（串口）
-    return 0; 
-}
+    // 【新增】使能 DMA1 时钟
+    rcc_periph_clock_enable(RCC_DMA1);
+    rcc_periph_clock_enable(RCC_GPIOA);
+    rcc_periph_clock_enable(RCC_GPIOC);
+    rcc_periph_clock_enable(RCC_USART1);
 
-int _isatty(int file) { 
-    return 1; 
-}
+    gpio_set_mode(GPIOC, GPIO_MODE_OUTPUT_2_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, GPIO13);
+    gpio_set(GPIOC, GPIO13);
 
-int _lseek(int file, int ptr, int dir) { 
-    return 0; 
-}
+    gpio_set_mode(GPIOA, GPIO_MODE_OUTPUT_50_MHZ, GPIO_CNF_OUTPUT_ALTFN_PUSHPULL, GPIO_USART1_TX);
+    gpio_set_mode(GPIOA, GPIO_MODE_INPUT, GPIO_CNF_INPUT_FLOAT, GPIO_USART1_RX);
 
-int _read(int file, char *ptr, int len) { 
-    return 0; 
-}
+    usart_set_baudrate(USART1, 115200);
+    usart_set_databits(USART1, 8);
+    usart_set_stopbits(USART1, USART_STOPBITS_1);
+    usart_set_mode(USART1, USART_MODE_TX_RX);
+    usart_set_parity(USART1, USART_PARITY_NONE);
+    usart_set_flow_control(USART1, USART_FLOWCONTROL_NONE);
 
-// 甚至连这两个防患于未然的也加上
-void _exit(int status) { 
-    while(1); 
-}
+    // 【核心黑魔法：配置 DMA1 通道4 给 USART1_TX 用】
+    dma_channel_reset(DMA1, DMA_CHANNEL4);
+    // 目的地：USART1 的数据寄存器 (物理固定地址)
+    dma_set_peripheral_address(DMA1, DMA_CHANNEL4, (uint32_t)&USART_DR(USART1));
+    // 方向：从内存 (dma_tx_buf) 读出，发往外设
+    dma_set_read_from_memory(DMA1, DMA_CHANNEL4);
+    // 内存地址自增 (发完 buf[0] 发 buf[1])，外设地址不自增 (永远砸向 USART_DR)
+    dma_enable_memory_increment_mode(DMA1, DMA_CHANNEL4);
+    dma_disable_peripheral_increment_mode(DMA1, DMA_CHANNEL4);
+    // 每次搬运 8 bit (1 字节)
+    dma_set_peripheral_size(DMA1, DMA_CHANNEL4, DMA_CCR_PSIZE_8BIT);
+    dma_set_memory_size(DMA1, DMA_CHANNEL4, DMA_CCR_MSIZE_8BIT);
+    // 优先级设为最高
+    dma_set_priority(DMA1, DMA_CHANNEL4, DMA_CCR_PL_HIGH);
 
-int _kill(int pid, int sig) { 
-    return -1; 
-}
-
-int _getpid(void) { 
-    return 1; 
-}
-
-// ==========================================
-// Shell 指令解析引擎 (体验标准库带来的优雅)
-// ==========================================
-void process_cmd(char *cmd) {
-    if (strcmp(cmd, "help") == 0) {
-        printf("Commands:\r\n");
-        printf("  help                - Show this message\r\n");
-        printf("  uid                 - Read 96-bit Unique ID\r\n");
-        printf("  read <hex>          - Read 32-bit value at address\r\n");
-        printf("  write <hex> <hex>   - Write 32-bit value to address\r\n");
-    } 
-    else if (strcmp(cmd, "uid") == 0) {
-        uint32_t *uid = (uint32_t *)0x1FFFF7E8;
-        // 一行搞定 96位 ID 的零填充十六进制打印
-        printf("Chip UID: %08X %08X %08X\r\n", 
-               (unsigned int)uid[2], (unsigned int)uid[1], (unsigned int)uid[0]);
-    } 
-    else if (strncmp(cmd, "read ", 5) == 0) {
-        unsigned int addr;
-        // sscanf 轻松解析输入的十六进制地址
-        if (sscanf(cmd + 5, "%x", &addr) == 1) {
-            addr &= ~3; // 强制 4 字节对齐，防止硬件总线异常 (HardFault)
-            uint32_t val = *(volatile uint32_t *)addr;
-            printf("Value at 0x%08X = 0x%08X\r\n", addr, (unsigned int)val);
-        } else {
-            printf("Error: Invalid address format. Usage: read 0x08000000\r\n");
-        }
-    }
-    else if (strncmp(cmd, "write ", 6) == 0) {
-        unsigned int addr, val;
-        // 同时解析地址和要写入的值
-        if (sscanf(cmd + 6, "%x %x", &addr, &val) == 2) {
-            addr &= ~3; 
-            *(volatile uint32_t *)addr = val; // 【极度危险且迷人】直接修改硬件内存！
-            printf("Written 0x%08X to 0x%08X\r\n", val, addr);
-        } else {
-            printf("Error: Invalid format. Usage: write 0x20000000 0x12345678\r\n");
-        }
-    }
-    else if (cmd[0] != '\0') {
-        printf("Unknown Command: %s. Type 'help'.\r\n", cmd);
-    }
-}
-
-// ==========================================
-// 系统初始化与主循环
-// ==========================================
-void main(void) {
-    // 1. 时钟树初始化 (72MHz)
-    FLASH_ACR = 0x12;
-    RCC_CR |= (1 << 16); 
-    while (!(RCC_CR & (1 << 17))); 
-    RCC_CFGR = (0x07 << 18) | (1 << 16); 
-    RCC_CR |= (1 << 24); 
-    while (!(RCC_CR & (1 << 25)));
-    RCC_CFGR |= 0x02; 
-    while ((RCC_CFGR & 0x0C) != 0x08);
-
-    // 2. 串口硬件初始化
-    uart_init();
-
-    setvbuf(stdout, NULL, _IONBF, 0);
+    // 【授权】让 USART1 允许 DMA 来接管发送
+    usart_enable_tx_dma(USART1);
     
-    // 3. 打印开机横幅 (现在可以用 printf 了！)
-    printf("\r\n\r\n=== Baremetal OS Booted ===\r\n");
-    printf("Compiled with Newlib-nano\r\n");
-    printf("stm32 > ");
+    usart_enable(USART1);
+}
 
-    char cmd_buf[64];
-    int cmd_idx = 0;
+/* ==========================================================
+ * Shell 命令解析器
+ * ========================================================== */
+static void execute_command(const char* cmd) {
+    if (strlen(cmd) == 0) return;
 
-    // 4. 交互式 Shell 死循环
+    if (strcmp(cmd, "help") == 0) {
+        printf("Available commands:\n");
+        printf("  help    - Show this message\n");
+        printf("  info    - System information\n");
+        printf("  led on  - Turn on PC13 LED\n");
+        printf("  led off - Turn off PC13 LED\n");
+        printf("  stress  - DMA asynchronous stress test\n"); // 新增压测命令
+    } 
+    else if (strcmp(cmd, "info") == 0) {
+        printf("[System] STM32F103C8T6\n");
+        printf("[Clock]  72 MHz (HSE PLL)\n");
+        printf("[Build]  libopencm3 baremetal (DMA Powered)\n");
+    } 
+    else if (strcmp(cmd, "led on") == 0) {
+        gpio_clear(GPIOC, GPIO13);
+        printf("PC13 LED is now ON.\n");
+    } 
+    else if (strcmp(cmd, "led off") == 0) {
+        gpio_set(GPIOC, GPIO13);
+        printf("PC13 LED is now OFF.\n");
+    }
+    // 【新增极限压测命令】
+    else if (strcmp(cmd, "stress") == 0) {
+        printf("DMA Stress Test started! This long string is being sent entirely by hardware DMA without blocking the CPU. The CPU is already executing the next instruction.\n");
+    }
+    else {
+        printf("bash: %s: command not found\n", cmd);
+    }
+}
+
+/* ==========================================================
+ * 主循环
+ * ========================================================== */
+int main(void) {
+    system_setup();
+
+    printf("\n\n");
+    printf("==================================\n");
+    printf("  STM32 Shell V2.0 (DMA Edition)  \n");
+    printf("==================================\n");
+    printf(SHELL_PROMPT);
+
     while (1) {
-        char c = uart_getc();
-        if (c != 0) {
-            // 回显字符
-            uart_putc(c); 
-            
-            if (c == '\r' || c == '\n') { 
-                printf("\n");
-                cmd_buf[cmd_idx] = '\0'; 
-                process_cmd(cmd_buf);    
-                cmd_idx = 0;             
-                printf("stm32 > ");
+        // 这里的单字符回显我们没做 DMA，是因为单个字符打断一下 CPU 无伤大雅
+        // 但当你敲回车执行大段 printf 时，DMA 就会全面接管！
+        if (usart_get_flag(USART1, USART_SR_RXNE)) {
+            char c = usart_recv(USART1);
+            if (c == '\n') continue; 
+
+            if (c == '\r') {
+                printf("\n"); 
+                rx_buf[rx_idx] = '\0'; 
+                execute_command(rx_buf);
+                rx_idx = 0;   
+                printf(SHELL_PROMPT);
             } 
-            else if (c == '\b' || c == 0x7F) { // 完美处理退格键
-                if (cmd_idx > 0) {
-                    cmd_idx--;
-                    // 终端光标回退，空格覆盖，再回退
-                    printf(" \b"); 
+            else if (c == '\b' || c == 0x7F) {
+                if (rx_idx > 0) {
+                    rx_idx--;
+                    usart_send_blocking(USART1, '\b'); 
+                    usart_send_blocking(USART1, ' ');  
+                    usart_send_blocking(USART1, '\b'); 
                 }
             } 
-            else if (cmd_idx < 63) {
-                cmd_buf[cmd_idx++] = c;  
+            else if (rx_idx < RX_BUF_SIZE - 1 && c >= 32 && c <= 126) {
+                rx_buf[rx_idx++] = c;
+                usart_send_blocking(USART1, c); 
             }
         }
     }
+    return 0;
 }
-
-// ==========================================
-// 裸机启动逻辑：复位处理函数
-// ==========================================
-// 顶部声明也要改一下，加上 _sidata
-extern uint32_t _sidata, _sdata, _edata, _etext, _sbss, _ebss;
-
-void Reset_Handler(void) {
-    // 【核心修复】：使用 LOADADDR 导出的绝对物理地址
-    uint32_t *src = &_sidata; 
-    uint32_t *dst = &_sdata;
-    while (dst < &_edata) *dst++ = *src++;
-    
-    dst = &_sbss;
-    while (dst < &_ebss) *dst++ = 0;
-    main();
-    while(1);
-}
-
-// ==========================================
-// 中断向量表
-// ==========================================
-__attribute__((section(".isr_vector")))
-void (*const vector_table[16])(void) = {
-    [0] = (void (*)(void))&_estack,
-    [1] = Reset_Handler,
-};
-
-
-// make clean && make
-// gdb-multiarch shell.elf -ex "so load.gdb"
-
-// make clean && make && gdb-multiarch shell.elf -ex "so load.gdb"

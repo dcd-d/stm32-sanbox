@@ -1,21 +1,27 @@
+PROJECT = firmware
+
+# 1. 你的手术刀（交叉编译工具链）
 CC = arm-none-eabi-gcc
 OBJCOPY = arm-none-eabi-objcopy
 
-# 编译参数：针对 Cortex-M3，开启 O2 优化，移除所有标准库依赖
-CFLAGS = -mthumb -mcpu=cortex-m3 -Os -g -ffreestanding -Wall
-LDFLAGS = -T link.ld -nostartfiles -Wl,--gc-sections --specs=nano.specs --specs=nosys.specs
+# 2. 芯片架构参数 (Cortex-M3)
+ARCH_FLAGS = -mcpu=cortex-m3 -mthumb
 
-all: shell.bin
+# 3. 编译选项 (包含子模块头文件，定义 STM32F1 宏)
+CFLAGS = $(ARCH_FLAGS) -Os -Wall -I./libopencm3/include -DSTM32F1
 
-# 链接两个 C 文件
-# shell.elf: main.c usb.c
-# 	$(CC) $(CFLAGS) $(LDFLAGS) main.c usb.c -o $@
+# 4. 链接选项 (终极缝合的灵魂所在)
+LDFLAGS = $(ARCH_FLAGS) -nostartfiles -T stm32f103c8t6.ld \
+          -L./libopencm3/lib -lopencm3_stm32f1 -Wl,--gc-sections \
+          --specs=nano.specs --specs=nosys.specs
 
-shell.elf: main.c uart.c
-	$(CC) $(CFLAGS) $(LDFLAGS) main.c uart.c -o $@
+# 5. 生产流水线
+all: $(PROJECT).bin
 
-# 提取纯二进制数据
-shell.bin: shell.elf
+$(PROJECT).elf: main.c
+	$(CC) $(CFLAGS) main.c $(LDFLAGS) -o $@
+
+$(PROJECT).bin: $(PROJECT).elf
 	$(OBJCOPY) -O binary $< $@
 
 clean:
